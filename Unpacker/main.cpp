@@ -115,7 +115,7 @@ static void ScanImports(void* Start, void* End) {
 				VEH2.Function = 0;
 				((void(*)())value)();
 			}
-			VirtualProtect(mbi.BaseAddress, oldProtect, mbi.Protect, &oldProtect); // Just to be sure
+			VirtualProtect(mbi.BaseAddress, 0x10, oldProtect, &oldProtect); // Just to be sure
 			if (VEH2.Function) {
 				value = VEH2.Function;
 				goto start;
@@ -296,6 +296,7 @@ static bool __fastcall LdrpCallInitRoutineHook(void* Unknown1, void* DllBase, UI
 
 void __declspec(noreturn) Load(wchar_t* Path) {
 	LoadLibraryW(Path);
+	ExitProcess(1);
 }
 
 int Entry() {
