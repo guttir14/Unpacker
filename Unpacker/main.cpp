@@ -44,6 +44,7 @@ static void RestoreContext(EXCEPTION_POINTERS* ExceptionInfo) {
 }
 
 LONG Handler2(EXCEPTION_POINTERS* ExceptionInfo) {
+	MEMORY_BASIC_INFORMATION mbi;
 	DWORD oldProtect;
 
 	// Saving out return context
@@ -70,7 +71,10 @@ LONG Handler2(EXCEPTION_POINTERS* ExceptionInfo) {
 
 		// Real call 
 		// (Or at least first call outside protected module) <- todo: fix this
-		VEH2.Function = (void*)rip;
+		if (rip && VirtualQuery((void*)rip, &mbi, sizeof(mbi)) && mbi.AllocationBase != GetModuleHandleA(0)) {
+			VEH2.Function = (void*)rip;
+		}
+		
 		RestoreContext(ExceptionInfo);
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
