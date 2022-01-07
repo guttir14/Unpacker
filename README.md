@@ -1,3 +1,6 @@
+## Be wary of
+- Imports analyzer calls virtualized routines to determine where they lead
+- Unpacker calls EP to unpack the binary and determine where OEP is
 ## Features: 
 - Restores OEP
 - Finds imports (even protected) and prints them to file
