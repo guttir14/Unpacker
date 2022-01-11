@@ -136,15 +136,11 @@ static void ScanImports(void* Start, void* End) {
 		}
 		else {
 			if (FindFunctionName(mbi.AllocationBase, value, &name)) {
-				
 				IO.Len += _swprintf(IO.Buffer + IO.Len, L"%p\t%p\t%ws!%S\n", it, (UINT8*)it - (UINT64)ImageStart, buffer, name);
 				goto end;
 			}
 		}
 
-		break;
-
-		MessageBoxA(0, "Fuck", "", MB_OK);
 		IO.Len += _swprintf(IO.Buffer + IO.Len, L"%p\t%p\t%ws!%p\n", it, (UINT8*)it - (UINT64)ImageStart, buffer, (UINT8*)value - (UINT64)mbi.AllocationBase);
 	end:
 
