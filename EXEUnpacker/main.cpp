@@ -3,7 +3,7 @@
 #include <psapi.h>
 #include <intrin.h>
 #include <stdio.h>
-#include <HookLib.h>
+#include <HookLib/HookLib.h>
 #include "utils.h"
 
 static wchar_t ImagePath[0x100];
@@ -25,67 +25,68 @@ struct {
 struct {
 	void* Heap = nullptr;
 	wchar_t* Buffer = nullptr;
-	DWORD Len = 0;
-	DWORD Size = 0;
+	UINT64 Len = 0;
+	UINT64 Size = 0;
 } IO;
 
+static __declspec(noreturn) void Exit(DWORD ExitCode) {
+	__fastfail(ExitCode);
+}
 
 struct {
 	void* Handle;
-	CONTEXT BackContext;
 	void* Function;
+	DWORD TID;
+	//CONTEXT BackContext;
+	//bool SavedContext;
+	//UINT8 Original;
 } VEH2;
-
-// Jump back where we started once
-static void RestoreContext(EXCEPTION_POINTERS* ExceptionInfo) {
-	*ExceptionInfo->ContextRecord = VEH2.BackContext;
-	RemoveVectoredExceptionHandler(VEH2.Handle);
-	VEH2.Handle = 0;
-}
 
 LONG Handler2(EXCEPTION_POINTERS* ExceptionInfo) {
 	MEMORY_BASIC_INFORMATION mbi;
 	DWORD oldProtect;
 
-	// Saving out return context
-	if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION) {
-		ExceptionInfo->ContextRecord->Rip += 2;
-		VEH2.BackContext = *ExceptionInfo->ContextRecord;
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
+	//// Saving out return context
+	//if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION && !VEH2.SavedContext) {
+	//	ExceptionInfo->ContextRecord->Rip += 2;
+	//	VEH2.BackContext = *ExceptionInfo->ContextRecord;
+	//	VEH2.SavedContext = true;
+	//	return EXCEPTION_CONTINUE_EXECUTION;
+	//}
 
-	// Make zombie thread
-	if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
-		ExceptionInfo->ContextRecord->EFlags |= 0x100;
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
-
-	// Zombie until real call
-	if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP) {
-
-		UINT64 rip = (UINT64)ExceptionInfo->ContextRecord->Rip;
-		if (rip >= (UINT64)ImageStart && rip < (UINT64)ImageStart + ImageSize) {
-			ExceptionInfo->ContextRecord->EFlags |= 0x100; // Still zombie...
+	if (GetCurrentThreadId() == VEH2.TID) {
+		// Make zombie thread
+		if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+			ExceptionInfo->ContextRecord->EFlags |= 0x100;
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 
-		// Real call 
-		// (Or at least first call outside protected module) <- todo: fix this
-		if (rip && VirtualQuery((void*)rip, &mbi, sizeof(mbi)) && mbi.AllocationBase != GetModuleHandleA(0)) {
-			VEH2.Function = (void*)rip;
+		// Zombie until real call
+		if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP) {
+
+			UINT64 rip = (UINT64)ExceptionInfo->ContextRecord->Rip;
+
+			if (rip >= (UINT64)ImageStart && rip < (UINT64)ImageStart + ImageSize) {
+				ExceptionInfo->ContextRecord->EFlags |= 0x100; // Still zombie...
+				return EXCEPTION_CONTINUE_EXECUTION;
+			}
+
+			// Real call 
+			// (Or at least first call outside protected module) <- todo: fix this
+			if (VirtualQuery((void*)rip, &mbi, sizeof(mbi))) {
+				if (rip && mbi.AllocationBase != GetModuleHandleA(0)) {
+					VEH2.Function = (void*)rip;
+				}
+			}
 		}
-		
-		RestoreContext(ExceptionInfo);
-		return EXCEPTION_CONTINUE_EXECUTION;
+
+		ExitThread(0);
+
 	}
 
-	// Fck...
-	if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_ACCESS_VIOLATION) {
-		RestoreContext(ExceptionInfo);
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
-	
+	//RestoreContext(ExceptionInfo);
 	return EXCEPTION_CONTINUE_SEARCH;
+
 }
 
 static void ScanImports(void* Start, void* End) {
@@ -93,48 +94,66 @@ static void ScanImports(void* Start, void* End) {
 	MEMORY_BASIC_INFORMATION mbi;
 	wchar_t buffer[0x100];
 	char* name;
+	HANDLE thread;
 	if (!IO.Buffer) {
 		IO.Heap = HeapCreate(HEAP_NO_SERIALIZE, 0, 0);
-		if (!IO.Heap) ExitProcess(1);
-		IO.Size = 0x00008000;
+		if (!IO.Heap) Exit(STATUS_ACCESS_VIOLATION);
+		IO.Size = 0x8000;
 		IO.Buffer = (wchar_t*)HeapAlloc(IO.Heap, 0, IO.Size);
 		if (!IO.Buffer) return;
 	}
+
+	VirtualProtect(Start, (UINT64)End - (UINT64)Start, PAGE_READWRITE, &oldProtect);
+
 	for (void** it = (void**)Start; it < End; it++) {
 		void* value = *it;
-		start:
-		
+	start:
+
 		if (!VirtualQuery(value, &mbi, sizeof(mbi)) || !mbi.AllocationBase || mbi.Type != MEM_IMAGE || (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0) continue;
+		
 		if (!K32GetModuleBaseNameW((void*)-1, (HMODULE)mbi.AllocationBase, buffer, 0x100)) continue;
 
 		if (mbi.AllocationBase == ImageStart) {
-			VEH2.Handle = AddVectoredExceptionHandler(1, Handler2);
-			VirtualProtect(mbi.BaseAddress, 0x10, mbi.Protect | PAGE_GUARD, &oldProtect);
-			__ud2();
-			if (VEH2.Handle) {
-				VEH2.Function = 0;
-				((void(*)())value)();
+			
+			if (!VEH2.Handle) {
+				VEH2.Handle = AddVectoredExceptionHandler(1, Handler2);
 			}
-			VirtualProtect(mbi.BaseAddress, 0x10, oldProtect, &oldProtect); // Just to be sure
-			if (VEH2.Function) {
-				value = VEH2.Function;
-				goto start;
+			
+			VirtualProtect(value, 1, mbi.Protect | PAGE_GUARD, &oldProtect);
+			//__ud2();
+
+			VEH2.Function = 0;
+			thread = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)value, 0, 0, &VEH2.TID);
+			if (thread) { 
+				if (WAIT_OBJECT_0 != WaitForSingleObject(thread, 1000)) TerminateThread(thread, STATUS_ACCESS_VIOLATION);
+				CloseHandle(thread);
+				if (VEH2.Function) {
+					value = VEH2.Function;
+					*it = value;
+					goto start;
+				}
+			}
+		}
+		else {
+			if (FindFunctionName(mbi.AllocationBase, value, &name)) {
+				
+				IO.Len += _swprintf(IO.Buffer + IO.Len, L"%p\t%p\t%ws!%S\n", it, (UINT8*)it - (UINT64)ImageStart, buffer, name);
+				goto end;
 			}
 		}
 
-		if (FindFunctionName(mbi.AllocationBase, value, &name)) {
-			IO.Len += _swprintf(IO.Buffer + IO.Len, L"%p\t%p\t%ws!%S\n", it, (UINT8*)it - (UINT64)ImageStart, buffer, name);
-		}
-		else {
-			IO.Len += _swprintf(IO.Buffer + IO.Len, L"%p\t%p\t%ws!%p\n", it, (UINT8*)it - (UINT64)ImageStart, buffer, (UINT8*)value - (UINT64)mbi.AllocationBase);
-		}
+		break;
+
+		MessageBoxA(0, "Fuck", "", MB_OK);
+		IO.Len += _swprintf(IO.Buffer + IO.Len, L"%p\t%p\t%ws!%p\n", it, (UINT8*)it - (UINT64)ImageStart, buffer, (UINT8*)value - (UINT64)mbi.AllocationBase);
+	end:
 
 		if (IO.Len * 2 > IO.Size - 0x2000) {
 			IO.Size += 0x8000;
 			void* buf = HeapReAlloc(IO.Heap, 0, IO.Buffer, IO.Size);
 			if (!buf) {
 				buf = HeapAlloc(IO.Heap, 0, IO.Size);
-				if (!buf) ExitProcess(1);
+				if (!buf) Exit(STATUS_ACCESS_VIOLATION);
 				memcpy(buf, IO.Buffer, IO.Len * 2);
 				HeapFree(IO.Heap, 0, IO.Buffer);
 			}
@@ -142,6 +161,12 @@ static void ScanImports(void* Start, void* End) {
 		}
 
 	}
+
+	if (VEH2.Handle) {
+		RemoveVectoredExceptionHandler(VEH2.Handle);
+		VEH2.Handle = 0;
+	}
+	
 }
 
 static void SaveImports(const wchar_t* Path) {
@@ -209,7 +234,9 @@ static __declspec(noreturn) void Dump() {
 				break;
 			}
 		}
-		if (strcmp((char*)section->Name, ".data") == 0 || strcmp((char*)section->Name, ".rdata") == 0) {
+
+		
+		if (strcmp((char*)section->Name, ".rdata") == 0) {
 			UINT8* start = (UINT8*)ImageStart + section->VirtualAddress;
 			UINT8* end = start + ALIGN_UP_BY(section->Misc.VirtualSize, 8);
 			ScanImports(start, end);
@@ -229,7 +256,9 @@ static __declspec(noreturn) void Dump() {
 	memcpy(ext, L"imports.txt", 24);
 	SaveImports(ImagePath);
 
-	ExitProcess(0);
+	MessageBoxA(0, "Done", "SUCCESS", MB_SYSTEMMODAL);
+
+	Exit(0);
 }
 
 struct {
@@ -238,14 +267,13 @@ struct {
 
 LONG Handler1(EXCEPTION_POINTERS* ExceptionInfo) {
 	DWORD oldProtect;
+	
 	if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_ACCESS_VIOLATION) {
-		
-		UINT64 rip = (UINT64)ExceptionInfo->ContextRecord->Rip;
+		UINT64 rip = ExceptionInfo->ContextRecord->Rip;
 		if (rip >= (UINT64)PackedStart && rip < (UINT64)PackedStart + PackedSize) {
 			VirtualProtect(PackedStart, PackedSize, PAGE_EXECUTE_READ, &oldProtect);
 			DWORD oep = rip - (UINT64)ImageStart;
 			PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((UINT64)CopyStart + ((PIMAGE_DOS_HEADER)CopyStart)->e_lfanew);
-			nt->OptionalHeader.FileAlignment = nt->OptionalHeader.SectionAlignment;
 			nt->OptionalHeader.AddressOfEntryPoint = oep;
 			ExceptionInfo->ContextRecord->Rip = (DWORD64)Dump;
 			RemoveVectoredExceptionHandler(VEH1.Handle);
@@ -256,58 +284,32 @@ LONG Handler1(EXCEPTION_POINTERS* ExceptionInfo) {
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static bool (*__fastcall LdrpCallInitRoutine)(void*, void*, UINT32, void*);
-static bool (*__fastcall LdrpCallInitRoutineOriginal)(void*, void*, UINT32, void*);
-
-static void* LdrpCallInitRoutineReturn;
-
-static bool __fastcall LdrpCallInitRoutineHook(void* Unknown1, void* DllBase, UINT32 Reason, void* Unknown2) {
-	wchar_t buffer[0x100];
+int Entry(void* DllBase, int Reason) {
 	DWORD oldProtect;
+	if (Reason == 1) {
+		DisableThreadLibraryCalls((HMODULE)DllBase);
 
-	if (_ReturnAddress() == LdrpCallInitRoutineReturn && 
-		K32GetModuleBaseNameW((void*)-1, (HMODULE)DllBase, buffer, 0x100) &&
-		wcsstr(ImagePath, buffer)) {
-		unhook(LdrpCallInitRoutineOriginal);
-	
-		PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((UINT64)DllBase + ((PIMAGE_DOS_HEADER)DllBase)->e_lfanew);
+		PLDR_DATA_TABLE_ENTRY data = (PLDR_DATA_TABLE_ENTRY)NtCurrentTeb()->ProcessEnvironmentBlock->Ldr->InMemoryOrderModuleList.Flink;
+
+		ImageStart = *(void**)((UINT64)data + 0x20);
+		wcsncpy(ImagePath, *(wchar_t**)((UINT64)data + 0x40), 0x100);
 		
-		ImageStart = DllBase;
+		PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((UINT64)ImageStart + ((PIMAGE_DOS_HEADER)ImageStart)->e_lfanew);
 		ImageSize = nt->OptionalHeader.SizeOfImage;
 
 		CopyStart = HeapAlloc(GetProcessHeap(), 0, ImageSize);
-		if (!CopyStart) ExitProcess(0);
+		if (!CopyStart) Exit(STATUS_ACCESS_VIOLATION);
 		memcpy(CopyStart, ImageStart, ImageSize);
 
 		PIMAGE_SECTION_HEADER section = (PIMAGE_SECTION_HEADER)((UINT64)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
 		PackedStart = (UINT8*)ImageStart + section->VirtualAddress;
 		PackedSize = ALIGN_UP_BY(section->Misc.VirtualSize, nt->OptionalHeader.SectionAlignment);
 		VirtualProtect(PackedStart, PackedSize, PAGE_READWRITE, &oldProtect);
-		VEH1.Handle = AddVectoredExceptionHandler(1, Handler1);
 
-		LdrpCallInitRoutine(Unknown1, DllBase, Reason, Unknown2);
-		Dump();
+		VEH1.Handle = AddVectoredExceptionHandler(1, Handler1);
 
 	}
 
-	return LdrpCallInitRoutineOriginal(Unknown1, DllBase, Reason, Unknown2);
-
-}
-
-void __declspec(noreturn) Load(wchar_t* Path) {
-	LoadLibraryW(Path);
-	ExitProcess(1);
-}
-
-int Entry() {
-	int argc;
-	wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-	if (argc < 2) return 1;
-	void* ntdll = GetModuleHandleA("NTDLL");
-	UINT8 pattern[]{ 0x41, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x53, 0x30, 0x49, 0x8B, 0xCD, 0xE8 };
-	LdrpCallInitRoutine = (decltype(LdrpCallInitRoutine))FindImagePointer(ntdll, pattern, sizeof(pattern), &LdrpCallInitRoutineReturn);
-	if (!LdrpCallInitRoutine) return 1;
-	LdrpCallInitRoutineOriginal = (decltype(LdrpCallInitRoutineOriginal))hook(LdrpCallInitRoutine, LdrpCallInitRoutineHook);
-	wcscpy(ImagePath, argv[1]);
-	Load(ImagePath);
+	return 1;
+	
 }
